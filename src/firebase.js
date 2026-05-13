@@ -38,6 +38,21 @@ if (isFirebaseConfigured) {
 // You can change this if you ever want to "reset" to a fresh shared dataset.
 const HOUSEHOLD_ID = 'household_v1';
 
+// Generate a unique device ID for this browser session so we can detect our own writes.
+// Stored in localStorage so it persists across page refreshes on the same device.
+export function getDeviceId() {
+  try {
+    let id = localStorage.getItem('device_id');
+    if (!id) {
+      id = 'dev_' + Math.random().toString(36).slice(2) + Date.now().toString(36);
+      localStorage.setItem('device_id', id);
+    }
+    return id;
+  } catch {
+    return 'dev_anon';
+  }
+}
+
 export async function cloudLoad(key, fallback) {
   if (!db) return fallback;
   try {
@@ -52,23 +67,39 @@ export async function cloudLoad(key, fallback) {
   }
 }
 
-export async function cloudSave(key, value) {
+// Save one or many keys at once. payload = { key1: value1, key2: value2 }
+export async function cloudSaveBatch(payload) {
   if (!db) return;
   try {
     const ref = doc(db, 'households', HOUSEHOLD_ID);
-    await setDoc(ref, { [key]: value, updatedAt: Date.now() }, { merge: true });
+    await setDoc(ref, {
+      ...payload,
+      lastWriter: getDeviceId(),
+      updatedAt: Date.now(),
+    }, { merge: true });
   } catch (e) {
     console.error('Cloud save failed:', e);
   }
 }
 
+// Legacy single-key save (kept for compatibility)
+export async function cloudSave(key, value) {
+  return cloudSaveBatch({ [key]: value });
+}
+
 // Subscribe to real-time changes from the cloud. Returns an unsubscribe fn.
+// onUpdate receives (data, isFromUs) so caller can ignore our own writes.
 export function cloudSubscribe(onUpdate) {
   if (!db) return () => {};
   const ref = doc(db, 'households', HOUSEHOLD_ID);
   return onSnapshot(ref, (snap) => {
-    if (snap.exists()) onUpdate(snap.data());
+    if (snap.exists()) {
+      const data = snap.data();
+      const isFromUs = data.lastWriter === getDeviceId();
+      onUpdate(data, isFromUs);
+    }
   }, (err) => {
     console.error('Cloud subscribe failed:', err);
   });
 }
+

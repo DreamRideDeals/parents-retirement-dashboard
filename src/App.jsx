@@ -1,4 +1,4 @@
-import React, { useState, useMemo, useEffect } from 'react';
+import React, { useState, useMemo, useEffect, useRef } from 'react';
 import { LineChart, Line, XAxis, YAxis, Tooltip, Legend, ResponsiveContainer, CartesianGrid, ReferenceLine, Area, AreaChart } from 'recharts';
 
 // ─────────────────────────── helpers ───────────────────────────
@@ -287,7 +287,7 @@ function simulate(initialProperties, levers) {
 // Two-tier storage: localStorage for instant load, Firebase (if configured) for sync across devices.
 // When Firebase is configured, the cloud is the source of truth and localStorage is just a cache.
 
-import { isFirebaseConfigured, cloudLoad, cloudSave, cloudSubscribe } from './firebase.js';
+import { isFirebaseConfigured, cloudLoad, cloudSaveBatch, cloudSubscribe } from './firebase.js';
 
 function loadFromStorage(key, fallback) {
   try {
@@ -299,15 +299,12 @@ function loadFromStorage(key, fallback) {
   }
 }
 
-function saveToStorage(key, value) {
+// Save to localStorage only. Cloud saves are debounced and batched separately.
+function saveToLocal(key, value) {
   try {
     localStorage.setItem(key, JSON.stringify(value));
   } catch (e) {
     console.error('Local save failed:', e);
-  }
-  // Also push to cloud if configured
-  if (isFirebaseConfigured) {
-    cloudSave(key, value);
   }
 }
 
@@ -377,8 +374,9 @@ export default function App() {
         }
       })();
 
-      // Step 3: subscribe to real-time updates
-      const unsubscribe = cloudSubscribe((data) => {
+      // Step 3: subscribe to real-time updates — but ignore our own writes
+      const unsubscribe = cloudSubscribe((data, isFromUs) => {
+        if (isFromUs) return; // Don't echo our own changes back to ourselves
         if (data.properties_v1) setProperties(data.properties_v1);
         if (data.levers_v1) applyLevers(data.levers_v1);
         if (data.acquisitions_v1) setAcquisitions(data.acquisitions_v1);
@@ -388,25 +386,92 @@ export default function App() {
     }
   }, []);
 
-  // Save when changed
-  useEffect(() => {
-    if (storageReady) saveToStorage('properties_v1', properties);
-  }, [properties, storageReady]);
+  // ─── Auto-save: localStorage instantly, cloud every 60 seconds ───
+  // Strategy: track when state changes (dirty flag). Every 60 seconds, if dirty, push to cloud.
+  // Also save on tab close as a safety net.
+  const dirtyRef = useRef(false);
+  const lastSavedAtRef = useRef(null);
+  const [saveStatus, setSaveStatus] = useState({ dirty: false, lastSavedAt: null, secondsUntilSave: 60 });
 
-  useEffect(() => {
-    if (storageReady) saveToStorage('levers_v1', {
+  // Build the snapshot once so save handlers and effect all see the same thing
+  const buildSnapshot = () => ({
+    properties_v1: properties,
+    levers_v1: {
       appreciation, rentGrowth, extraPrincipalMonthly, cashFlowReinvestPct, snowballTargetId,
       targetCashFlow, targetYear, horizonYears, includeNewProps,
-    });
-  }, [appreciation, rentGrowth, extraPrincipalMonthly, cashFlowReinvestPct, snowballTargetId, targetCashFlow, targetYear, horizonYears, includeNewProps, storageReady]);
+    },
+    acquisitions_v1: acquisitions,
+    lumps_v1: lumpPayments,
+  });
 
+  // Save to localStorage immediately on every change (free, no quota concerns)
   useEffect(() => {
-    if (storageReady) saveToStorage('acquisitions_v1', acquisitions);
-  }, [acquisitions, storageReady]);
+    if (!storageReady) return;
+    const snap = buildSnapshot();
+    saveToLocal('properties_v1', snap.properties_v1);
+    saveToLocal('levers_v1', snap.levers_v1);
+    saveToLocal('acquisitions_v1', snap.acquisitions_v1);
+    saveToLocal('lumps_v1', snap.lumps_v1);
+    // Mark dirty so the auto-save timer knows there's work to do
+    dirtyRef.current = true;
+    setSaveStatus(s => ({ ...s, dirty: true }));
+  }, [
+    properties, acquisitions, lumpPayments,
+    appreciation, rentGrowth, extraPrincipalMonthly, cashFlowReinvestPct, snowballTargetId,
+    targetCashFlow, targetYear, horizonYears, includeNewProps,
+    storageReady,
+  ]);
 
+  // The actual cloud save function — used by the timer AND the manual button
+  const pushToCloud = async () => {
+    if (!isFirebaseConfigured || !dirtyRef.current) return;
+    dirtyRef.current = false;
+    setSaveStatus(s => ({ ...s, dirty: false }));
+    try {
+      await cloudSaveBatch(buildSnapshot());
+      lastSavedAtRef.current = Date.now();
+      setSaveStatus(s => ({ ...s, lastSavedAt: Date.now(), dirty: false }));
+    } catch (e) {
+      console.error('Cloud save failed:', e);
+      // Re-flag as dirty so we'll retry next interval
+      dirtyRef.current = true;
+      setSaveStatus(s => ({ ...s, dirty: true }));
+    }
+  };
+
+  // Every 60 seconds, push to cloud if anything changed
   useEffect(() => {
-    if (storageReady) saveToStorage('lumps_v1', lumpPayments);
-  }, [lumpPayments, storageReady]);
+    if (!isFirebaseConfigured || !storageReady) return;
+    const interval = setInterval(pushToCloud, 60_000);
+    return () => clearInterval(interval);
+  }, [storageReady]);
+
+  // Every second, update the "seconds until next save" countdown for the UI
+  useEffect(() => {
+    if (!isFirebaseConfigured) return;
+    const interval = setInterval(() => {
+      setSaveStatus(s => {
+        if (!s.lastSavedAt && !s.dirty) return s;
+        // Calculate seconds since the timer last fired
+        const secondsSinceLastSave = s.lastSavedAt ? Math.floor((Date.now() - s.lastSavedAt) / 1000) : null;
+        return { ...s, secondsSinceLastSave };
+      });
+    }, 1000);
+    return () => clearInterval(interval);
+  }, []);
+
+  // Safety net: push to cloud before the page unloads
+  useEffect(() => {
+    if (!isFirebaseConfigured) return;
+    const handler = () => {
+      if (dirtyRef.current) {
+        // Synchronous-ish save attempt — may or may not complete, but worth trying
+        cloudSaveBatch(buildSnapshot());
+      }
+    };
+    window.addEventListener('beforeunload', handler);
+    return () => window.removeEventListener('beforeunload', handler);
+  });
 
   // Run simulation
   const sim = useMemo(() => simulate(properties, {
@@ -448,7 +513,7 @@ export default function App() {
             <div className="text-xs uppercase tracking-[0.3em]" style={{ color: '#8B6F47' }}>
               Retirement gameplan · Personalized
             </div>
-            <CloudStatusBadge status={cloudStatus} />
+            <CloudStatusBadge status={cloudStatus} saveStatus={saveStatus} onSaveNow={pushToCloud} />
           </div>
           <h1 className="display text-4xl sm:text-6xl font-bold leading-[0.95] mb-4" style={{ color: '#0F1F1A' }}>
             Mom & Dad's<br />
@@ -568,21 +633,53 @@ export default function App() {
 
 // ─────────────────────────── Cloud status badge ───────────────────────────
 
-function CloudStatusBadge({ status }) {
-  const config = {
-    'connecting': { bg: '#EFE7D2', fg: '#8B6F47', label: '○ Syncing…' },
-    'connected':  { bg: '#D4E8DA', fg: '#2D5043', label: '● Synced across devices' },
-    'error':      { bg: '#F5D5C4', fg: '#B5563D', label: '⚠ Sync error — using local only' },
-    'local-only': { bg: '#EFE7D2', fg: '#8B6F47', label: '○ Local only (this device)' },
-  };
-  const c = config[status] || config['local-only'];
+function CloudStatusBadge({ status, saveStatus, onSaveNow }) {
+  // Build label that incorporates save state when connected
+  let bg, fg, label, tooltip;
+
+  if (status === 'connecting') {
+    bg = '#EFE7D2'; fg = '#8B6F47'; label = '○ Syncing…';
+  } else if (status === 'error') {
+    bg = '#F5D5C4'; fg = '#B5563D'; label = '⚠ Sync error — using local only';
+  } else if (status === 'local-only') {
+    bg = '#EFE7D2'; fg = '#8B6F47'; label = '○ Local only (this device)';
+    tooltip = 'Set up Firebase to sync data across devices. See FIREBASE_SETUP.md.';
+  } else if (status === 'connected') {
+    if (saveStatus?.dirty) {
+      bg = '#FFF4D6'; fg = '#8B6F47'; label = '◐ Unsaved changes — auto-saves every minute';
+    } else if (saveStatus?.lastSavedAt) {
+      const secs = saveStatus.secondsSinceLastSave ?? 0;
+      let timeLabel;
+      if (secs < 5) timeLabel = 'just now';
+      else if (secs < 60) timeLabel = `${secs}s ago`;
+      else if (secs < 3600) timeLabel = `${Math.floor(secs / 60)}m ago`;
+      else timeLabel = `${Math.floor(secs / 3600)}h ago`;
+      bg = '#D4E8DA'; fg = '#2D5043'; label = `● Saved ${timeLabel} · synced`;
+    } else {
+      bg = '#D4E8DA'; fg = '#2D5043'; label = '● Synced across devices';
+    }
+  }
+
+  const showSaveNow = status === 'connected' && saveStatus?.dirty;
+
   return (
-    <div
-      className="mono text-xs px-2 py-1"
-      style={{ background: c.bg, color: c.fg, borderRadius: 2, letterSpacing: 0.5 }}
-      title={status === 'local-only' ? 'Set up Firebase to sync data across devices. See FIREBASE_SETUP.md.' : ''}
-    >
-      {c.label}
+    <div className="flex items-center gap-2">
+      <div
+        className="mono text-xs px-2 py-1"
+        style={{ background: bg, color: fg, borderRadius: 2, letterSpacing: 0.5 }}
+        title={tooltip || ''}
+      >
+        {label}
+      </div>
+      {showSaveNow && (
+        <button
+          onClick={onSaveNow}
+          className="mono text-xs px-2 py-1"
+          style={{ background: '#2D5043', color: '#F5EFE2', borderRadius: 2, letterSpacing: 0.5, border: 'none', cursor: 'pointer' }}
+        >
+          Save now
+        </button>
+      )}
     </div>
   );
 }
@@ -870,6 +967,21 @@ function PropertyCard({ property: p, isExpanded, onToggle, onUpdate }) {
 }
 
 function Field({ label, value, type, prefix, suffix, step, onChange }) {
+  // Local state so typing doesn't get clobbered by parent re-renders.
+  // We only commit the value upward when the user blurs the field or presses Enter.
+  const [localValue, setLocalValue] = useState(value);
+  const [isFocused, setIsFocused] = useState(false);
+
+  // If parent value changes (e.g. cloud sync from another device) and we're not focused, update display.
+  useEffect(() => {
+    if (!isFocused) setLocalValue(value);
+  }, [value, isFocused]);
+
+  const commit = () => {
+    if (localValue !== value) onChange(localValue);
+    setIsFocused(false);
+  };
+
   return (
     <div>
       <label className="text-xs uppercase tracking-wider block mb-1" style={{ color: '#5A6F64' }}>{label}</label>
@@ -877,9 +989,12 @@ function Field({ label, value, type, prefix, suffix, step, onChange }) {
         {prefix && <span className="px-2 mono text-sm" style={{ color: '#8B6F47' }}>{prefix}</span>}
         <input
           type={type}
-          value={value}
+          value={localValue}
           step={step}
-          onChange={(e) => onChange(e.target.value)}
+          onChange={(e) => setLocalValue(e.target.value)}
+          onFocus={() => setIsFocused(true)}
+          onBlur={commit}
+          onKeyDown={(e) => { if (e.key === 'Enter') e.target.blur(); }}
           className="flex-1 px-2 py-2 mono text-sm bg-transparent outline-none"
           style={{ color: '#1A2E26', minWidth: 0, width: '100%' }}
         />
