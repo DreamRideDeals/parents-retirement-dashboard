@@ -283,7 +283,11 @@ function simulate(initialProperties, levers) {
   return { yearly, monthly, finalProperties: props };
 }
 
-// ─────────────────────────── persistent storage helpers (localStorage) ───────────────────────────
+// ─────────────────────────── persistent storage helpers ───────────────────────────
+// Two-tier storage: localStorage for instant load, Firebase (if configured) for sync across devices.
+// When Firebase is configured, the cloud is the source of truth and localStorage is just a cache.
+
+import { isFirebaseConfigured, cloudLoad, cloudSave, cloudSubscribe } from './firebase.js';
 
 function loadFromStorage(key, fallback) {
   try {
@@ -299,7 +303,11 @@ function saveToStorage(key, value) {
   try {
     localStorage.setItem(key, JSON.stringify(value));
   } catch (e) {
-    console.error('Save failed:', e);
+    console.error('Local save failed:', e);
+  }
+  // Also push to cloud if configured
+  if (isFirebaseConfigured) {
+    cloudSave(key, value);
   }
 }
 
@@ -321,28 +329,63 @@ export default function App() {
   const [lumpPayments, setLumpPayments] = useState([]);
   const [storageReady, setStorageReady] = useState(false);
   const [activeTab, setActiveTab] = useState('overview');
+  const [cloudStatus, setCloudStatus] = useState(isFirebaseConfigured ? 'connecting' : 'local-only');
 
-  // Load on mount (synchronous — localStorage is fast)
+  // Helper: apply a "levers" object to all the lever-related state setters
+  const applyLevers = (lvr) => {
+    if (!lvr) return;
+    if (lvr.appreciation !== undefined) setAppreciation(lvr.appreciation);
+    if (lvr.rentGrowth !== undefined) setRentGrowth(lvr.rentGrowth);
+    if (lvr.extraPrincipalMonthly !== undefined) setExtraPrincipalMonthly(lvr.extraPrincipalMonthly);
+    if (lvr.cashFlowReinvestPct !== undefined) setCashFlowReinvestPct(lvr.cashFlowReinvestPct);
+    if (lvr.snowballTargetId !== undefined) setSnowballTargetId(lvr.snowballTargetId);
+    if (lvr.targetCashFlow !== undefined) setTargetCashFlow(lvr.targetCashFlow);
+    if (lvr.targetYear !== undefined) setTargetYear(lvr.targetYear);
+    if (lvr.horizonYears !== undefined) setHorizonYears(lvr.horizonYears);
+    if (lvr.includeNewProps !== undefined) setIncludeNewProps(lvr.includeNewProps);
+  };
+
+  // Load on mount: first localStorage (instant), then cloud (authoritative if configured)
   useEffect(() => {
+    // Step 1: instant load from localStorage
     const props = loadFromStorage('properties_v1', SEED_PROPERTIES);
     const lvr = loadFromStorage('levers_v1', null);
     const acq = loadFromStorage('acquisitions_v1', []);
     const lumps = loadFromStorage('lumps_v1', []);
     if (props) setProperties(props);
-    if (lvr) {
-      if (lvr.appreciation !== undefined) setAppreciation(lvr.appreciation);
-      if (lvr.rentGrowth !== undefined) setRentGrowth(lvr.rentGrowth);
-      if (lvr.extraPrincipalMonthly !== undefined) setExtraPrincipalMonthly(lvr.extraPrincipalMonthly);
-      if (lvr.cashFlowReinvestPct !== undefined) setCashFlowReinvestPct(lvr.cashFlowReinvestPct);
-      if (lvr.snowballTargetId !== undefined) setSnowballTargetId(lvr.snowballTargetId);
-      if (lvr.targetCashFlow !== undefined) setTargetCashFlow(lvr.targetCashFlow);
-      if (lvr.targetYear !== undefined) setTargetYear(lvr.targetYear);
-      if (lvr.horizonYears !== undefined) setHorizonYears(lvr.horizonYears);
-      if (lvr.includeNewProps !== undefined) setIncludeNewProps(lvr.includeNewProps);
-    }
+    applyLevers(lvr);
     if (acq) setAcquisitions(acq);
     if (lumps) setLumpPayments(lumps);
     setStorageReady(true);
+
+    // Step 2: if Firebase is configured, fetch cloud data (which may be newer)
+    if (isFirebaseConfigured) {
+      (async () => {
+        try {
+          const cloudProps = await cloudLoad('properties_v1', null);
+          const cloudLvr = await cloudLoad('levers_v1', null);
+          const cloudAcq = await cloudLoad('acquisitions_v1', null);
+          const cloudLumps = await cloudLoad('lumps_v1', null);
+          if (cloudProps) setProperties(cloudProps);
+          if (cloudLvr) applyLevers(cloudLvr);
+          if (cloudAcq) setAcquisitions(cloudAcq);
+          if (cloudLumps) setLumpPayments(cloudLumps);
+          setCloudStatus('connected');
+        } catch (e) {
+          console.error('Cloud load failed:', e);
+          setCloudStatus('error');
+        }
+      })();
+
+      // Step 3: subscribe to real-time updates
+      const unsubscribe = cloudSubscribe((data) => {
+        if (data.properties_v1) setProperties(data.properties_v1);
+        if (data.levers_v1) applyLevers(data.levers_v1);
+        if (data.acquisitions_v1) setAcquisitions(data.acquisitions_v1);
+        if (data.lumps_v1) setLumpPayments(data.lumps_v1);
+      });
+      return () => unsubscribe();
+    }
   }, []);
 
   // Save when changed
@@ -401,8 +444,11 @@ export default function App() {
 
         {/* ─── Header ─── */}
         <header className="mb-8">
-          <div className="text-xs uppercase tracking-[0.3em] mb-3" style={{ color: '#8B6F47' }}>
-            Retirement gameplan · Personalized
+          <div className="flex items-baseline justify-between flex-wrap gap-2 mb-3">
+            <div className="text-xs uppercase tracking-[0.3em]" style={{ color: '#8B6F47' }}>
+              Retirement gameplan · Personalized
+            </div>
+            <CloudStatusBadge status={cloudStatus} />
           </div>
           <h1 className="display text-4xl sm:text-6xl font-bold leading-[0.95] mb-4" style={{ color: '#0F1F1A' }}>
             Mom & Dad's<br />
@@ -519,6 +565,27 @@ export default function App() {
 }
 
 // ─────────────────────────── Headline status ───────────────────────────
+
+// ─────────────────────────── Cloud status badge ───────────────────────────
+
+function CloudStatusBadge({ status }) {
+  const config = {
+    'connecting': { bg: '#EFE7D2', fg: '#8B6F47', label: '○ Syncing…' },
+    'connected':  { bg: '#D4E8DA', fg: '#2D5043', label: '● Synced across devices' },
+    'error':      { bg: '#F5D5C4', fg: '#B5563D', label: '⚠ Sync error — using local only' },
+    'local-only': { bg: '#EFE7D2', fg: '#8B6F47', label: '○ Local only (this device)' },
+  };
+  const c = config[status] || config['local-only'];
+  return (
+    <div
+      className="mono text-xs px-2 py-1"
+      style={{ background: c.bg, color: c.fg, borderRadius: 2, letterSpacing: 0.5 }}
+      title={status === 'local-only' ? 'Set up Firebase to sync data across devices. See FIREBASE_SETUP.md.' : ''}
+    >
+      {c.label}
+    </div>
+  );
+}
 
 function HeadlineStatus({ targetCashFlow, targetYear, goalReachedYear, cashFlowAtGoalYear, onTrack, ahead, gap }) {
   let bg, accent, headline, sub;

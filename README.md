@@ -108,14 +108,11 @@ When you want to change something:
 
 ## How the app stores data
 
-All data — your parents' 6 property entries, lever positions, planned acquisitions — saves to **their own browser's localStorage**. This means:
+By default, all data saves to **the browser's localStorage** on whichever device opens the URL. This means data persists across refreshes on that device, but doesn't sync across devices.
 
-- ✅ Refreshing the page keeps their data.
-- ✅ Closing and reopening the browser keeps their data.
-- ⚠️ Different devices = different data. If they enter properties on a laptop and then open the URL on their phone, the phone starts fresh.
-- ⚠️ Clearing browser cookies/data wipes their entries.
+**To enable cross-device sync** (so your parents can use it from multiple computers/phones and see the same data), follow the **FIREBASE_SETUP.md** guide. Free, ~15 minutes of clicking.
 
-If they want the same data on multiple devices, the simplest workaround is for one of them to enter everything on a primary device and bookmark it there. (For shared/synced data we'd need a backend like Firebase, which is more complex.)
+Once Firebase is set up, you'll see "● Synced across devices" in the dashboard header. Without it, you'll see "○ Local only (this device)".
 
 ---
 
